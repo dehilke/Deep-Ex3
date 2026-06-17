@@ -10,7 +10,7 @@
 # You can instead set api_key here, but don't commit a real key.
 
 [model]
-model = gpt-4o-mini
+model = openrouter/openai/gpt-oss-120b:free
 # api_key =
 # api_base =
 temperature = 0.0
