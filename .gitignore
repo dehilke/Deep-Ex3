@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local config / secrets (real config lives in ~/doit.cfg, never commit keys)
+doit.cfg
+
+# OS
+.DS_Store

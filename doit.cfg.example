@@ -1,0 +1,16 @@
+# Copy this file to ~/doit.cfg and edit it.
+#   cp doit.cfg.example ~/doit.cfg
+#
+# `model` is any LiteLLM model string. Examples:
+#   gpt-4o-mini                      (OpenAI; set OPENAI_API_KEY or api_key below)
+#   anthropic/claude-haiku-4-5-20251001   (Anthropic; set ANTHROPIC_API_KEY)
+#   ollama/llama3.1                  (local via Ollama; set api_base below)
+#
+# API keys: easiest is to export them in your shell (OPENAI_API_KEY=...).
+# You can instead set api_key here, but don't commit a real key.
+
+[model]
+model = gpt-4o-mini
+# api_key =
+# api_base =
+temperature = 0.0
