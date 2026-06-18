@@ -27,7 +27,6 @@ CONFIG_PATH = Path.home() / "doit.cfg"
 # How a command is allowed to run.
 SAFE = "safe"          # read-only, run without asking
 CONFIRM = "confirm"    # modifies the filesystem / state, ask first
-DANGEROUS = "dangerous"  # destructive enough that we refuse outright
 
 
 SYSTEM_PROMPT = """\
@@ -37,16 +36,23 @@ into a single shell command for bash on Linux.
 Respond with ONLY a JSON object (no markdown fences) with these fields:
   "kind": one of "command", "answer", "refuse".
       - "command": the request maps to a shell command to run.
-      - "answer":  the request is a question (e.g. "how do I ...") that should
-                   be answered in text, not executed.
-      - "refuse":  the request cannot or should not be turned into a command.
+      - "answer":  the request is not a command to execute but should still get
+                   a helpful reply -- a question ("how do I ...?"), small talk
+                   ("tell me a joke"), or a question about yourself
+                   ("what can you do?").
+      - "refuse":  the request cannot be done as a shell command (e.g. it needs
+                   information you don't have, or it isn't a shell task at all).
   "command": the shell command string (only when kind == "command", else "").
-  "risk": one of "safe", "confirm", "dangerous" (only when kind == "command").
-      - "safe":      read-only, no side effects (ls, cat, grep, find, df, ...).
-      - "confirm":   creates/moves/changes files or state (mkdir, mv, pip install, git commit, ...).
-      - "dangerous": destructive or irreversible (rm -rf /, dd to a disk, mkfs,
-                     fork bombs, curl | sh from untrusted sources, ...).
-  "explanation": one short sentence explaining the command or answer.
+  "risk": one of "safe", "confirm" (only when kind == "command").
+      - "safe":    read-only, no side effects (ls, cat, grep, find, df, ...).
+      - "confirm": changes or destroys files or state -- creating, moving, or
+                   deleting files, installing packages, writing to disks, etc.
+                   (mkdir, mv, rm, dd, mkfs, pip install, git commit, ...).
+  "answer": the text reply to show the user (only when kind == "answer" or
+            "refuse"; may be several sentences). Use a professional, neutral
+            tone -- never scolding or angry.
+  "explanation": one short sentence explaining the command (only when
+                 kind == "command").
 
 Prefer a single command. Do not invent file names the user did not mention."""
 
@@ -93,8 +99,8 @@ def ask_model(settings, instruction):
     try:
         return json.loads(content)
     except json.JSONDecodeError:
-        return {"kind": "refuse", "command": "", "risk": DANGEROUS,
-                "explanation": f"Could not parse model reply: {content[:200]}"}
+        return {"kind": "refuse", "command": "", "risk": CONFIRM,
+                "answer": f"Could not parse model reply: {content[:200]}"}
 
 
 def run_command(command):
@@ -124,27 +130,23 @@ def confirm(prompt):
 def handle(settings, instruction):
     reply = ask_model(settings, instruction)
     kind = reply.get("kind", "refuse")
-    explanation = reply.get("explanation", "")
 
     if kind == "answer":
-        print(explanation)
+        print(reply.get("answer", ""))
         return
 
     if kind == "refuse":
-        print(f"doit: can't do that. {explanation}")
+        print(reply.get("answer", "") or "doit: that can't be done as a shell command.")
         return
 
     command = reply.get("command", "").strip()
-    risk = reply.get("risk", DANGEROUS)
+    risk = reply.get("risk", CONFIRM)
+    explanation = reply.get("explanation", "")
     if not command:
         print(f"doit: no command produced. {explanation}")
         return
 
     print(f"# {explanation}")
-
-    if risk == DANGEROUS:
-        print(f"doit: refusing dangerous command:\n  {command}")
-        return
 
     if risk == CONFIRM:
         print(f"Proposed command:\n  {command}")
