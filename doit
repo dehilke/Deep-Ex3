@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""doit - an interactive LLM agent that turns natural language into shell commands.
+
+This is the "basics" section: take a natural-language request, ask an LLM to
+translate it into a single shell command, classify how risky that command is,
+ask for confirmation when needed, run it, and show the result.
+
+Later sections (multi-turn history, memory, shell-history awareness, sessions,
+local/tool-calling models, ...) build on top of this structure.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from configparser import ConfigParser
+from pathlib import Path
+
+try:
+    import litellm
+except ImportError:
+    sys.exit("doit: the 'litellm' package is required. Run: pip install litellm")
+
+
+CONFIG_PATH = Path.home() / "doit.cfg"
+
+# How a command is allowed to run.
+SAFE = "safe"          # read-only, run without asking
+CONFIRM = "confirm"    # modifies the filesystem / state, ask first
+
+
+SYSTEM_PROMPT = """\
+You are `doit`, an assistant that converts a user's natural-language request \
+into a single shell command for bash on Linux.
+
+Respond with ONLY a JSON object (no markdown fences) with these fields:
+  "kind": one of "command", "answer", "refuse".
+      - "command": the request maps to a shell command to run.
+      - "answer":  the request is not a command to execute but should still get
+                   a helpful reply -- a question ("how do I ...?"), small talk
+                   ("tell me a joke"), or a question about yourself
+                   ("what can you do?").
+      - "refuse":  the request cannot be done as a shell command (e.g. it needs
+                   information you don't have, or it isn't a shell task at all).
+  "command": the shell command string (only when kind == "command", else "").
+  "risk": one of "safe", "confirm" (only when kind == "command").
+      - "safe":    read-only, no side effects (ls, cat, grep, find, df, ...).
+      - "confirm": changes or destroys files or state -- creating, moving, or
+                   deleting files, installing packages, writing to disks, etc.
+                   (mkdir, mv, rm, dd, mkfs, pip install, git commit, ...).
+  "answer": the text reply to show the user (only when kind == "answer" or
+            "refuse"; may be several sentences). Use a professional, neutral
+            tone -- never scolding or angry.
+  "explanation": one short sentence explaining the command (only when
+                 kind == "command").
+
+Prefer a single command. Do not invent file names the user did not mention."""
+
+
+def load_config():
+    """Read ~/doit.cfg. Returns a dict of model settings."""
+    cfg = ConfigParser()
+    if CONFIG_PATH.exists():
+        cfg.read(CONFIG_PATH)
+    model_section = cfg["model"] if cfg.has_section("model") else {}
+
+    settings = {
+        "model": model_section.get("model", "gpt-4o-mini"),
+        "api_key": model_section.get("api_key", ""),
+        "api_base": model_section.get("api_base", ""),
+        "temperature": model_section.getfloat("temperature", 0.0)
+        if model_section else 0.0,
+    }
+    return settings
+
+
+def ask_model(settings, instruction):
+    """Send the instruction to the LLM and parse its JSON reply."""
+    kwargs = {
+        "model": settings["model"],
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": instruction},
+        ],
+        "temperature": settings["temperature"],
+    }
+    if settings["api_key"]:
+        kwargs["api_key"] = settings["api_key"]
+    if settings["api_base"]:
+        kwargs["api_base"] = settings["api_base"]
+
+    response = litellm.completion(**kwargs)
+    content = response["choices"][0]["message"]["content"].strip()
+
+    # Be forgiving: strip accidental ```json fences before parsing.
+    if content.startswith("```"):
+        content = content.strip("`")
+        content = content[content.find("{"):]
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return {"kind": "refuse", "command": "", "risk": CONFIRM,
+                "answer": f"Could not parse model reply: {content[:200]}"}
+
+
+def run_command(command):
+    """Execute a shell command, streaming nothing back to the model (yet)."""
+    print(f"$ {command}")
+    result = subprocess.run(
+        command, shell=True, executable="/bin/bash",
+        capture_output=True, text=True,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode != 0:
+        print(f"[exit code {result.returncode}]", file=sys.stderr)
+    return result
+
+
+def confirm(prompt):
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def handle(settings, instruction):
+    reply = ask_model(settings, instruction)
+    kind = reply.get("kind", "refuse")
+
+    if kind == "answer":
+        print(reply.get("answer", ""))
+        return
+
+    if kind == "refuse":
+        print(reply.get("answer", "") or "doit: that can't be done as a shell command.")
+        return
+
+    command = reply.get("command", "").strip()
+    risk = reply.get("risk", CONFIRM)
+    explanation = reply.get("explanation", "")
+    if not command:
+        print(f"doit: no command produced. {explanation}")
+        return
+
+    print(f"# {explanation}")
+
+    if risk == CONFIRM:
+        print(f"Proposed command:\n  {command}")
+        if not confirm("Run it?"):
+            print("Aborted.")
+            return
+
+    run_command(command)
+
+
+def main(argv):
+    instruction = " ".join(argv).strip()
+    if not instruction:
+        sys.exit("usage: doit <natural language request>")
+    settings = load_config()
+    handle(settings, instruction)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
