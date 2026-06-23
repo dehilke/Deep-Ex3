@@ -4,13 +4,25 @@
 # `model` is any LiteLLM model string. Examples:
 #   gpt-4o-mini                      (OpenAI; set OPENAI_API_KEY or api_key below)
 #   anthropic/claude-haiku-4-5-20251001   (Anthropic; set ANTHROPIC_API_KEY)
-#   ollama/llama3.1                  (local via Ollama; set api_base below)
+#   ollama_chat/lfm2.5               (local via Ollama; set api_base below)
 #
-# API keys: easiest is to export them in your shell (OPENAI_API_KEY=...).
-# You can instead set api_key here, but don't commit a real key.
+# For local Ollama models prefer the `ollama_chat/` prefix over `ollama/`:
+# it uses Ollama's chat endpoint, which handles system prompts and tool
+# calls better. No api_key is needed for a local model -- leave it blank.
+#
+# API keys (cloud only): easiest is to export them in your shell
+# (OPENAI_API_KEY=...). You can instead set api_key here, but don't commit a
+# real key.
+#
+# tool_calling: when true, doit uses the model's NATIVE tool-calling API
+# (a run_shell_command tool) instead of asking for JSON in the prompt. Only
+# enable it for models trained for tool use (e.g. lfm2.5). Leave it false for
+# plain instruction models (e.g. gemma3:4b) and any model that lacks tool
+# support -- they stay on the prompt-and-parse path.
 
 [model]
 model = openrouter/openai/gpt-oss-120b:free
 # api_key =
 # api_base =
 temperature = 0.0
+tool_calling = false
