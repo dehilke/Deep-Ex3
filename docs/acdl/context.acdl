@@ -1,0 +1,76 @@
+// ===========================================================================
+// ACDL: the context doit sends to the LLM on every turn.
+// Reference: https://acdlang26.github.io/acdlsite/syntax-reference.html
+//
+// One doit invocation = one turn = @T. State that survives between turns lives
+// on disk under ~/.doit/ and is pulled back in here as context blocks.
+//
+// Namespaces used:
+//   sys.*   agent state read from disk (memory, history, profile, shell hist)
+//   env.*   this turn's external input (the user's instruction, cwd)
+//   resp.*  the model's JSON reply for a turn
+// ===========================================================================
+
+DoitTurn[@T]: {
+
+    // --- System: base instructions + all context blocks -------------------
+    S: {
+        INSTRUCTIONS                       // the fixed task + JSON schema spec
+        RESPONSE_SCHEMA                    // kind/command/risk/cd/memories/...
+
+        // Persistent memory about the user (survives shells & directories).
+        If sys.memory.count > 0 {
+            MEMORY(sys.memory.items)       // numbered [id] text list
+        }
+
+        // Project profile for the current folder (.doit.md), if any. Extension.
+        If sys.project_profile.exists {
+            PROJECT_PROFILE(sys.project_profile.path, sys.project_profile.text)
+        }
+
+        // User-awareness: recent commands from the real shell history,
+        // each tagged (user) or (doit) so the model separates the two streams.
+        If sys.shell_history.count > 0 {
+            SHELL_ACTIVITY(sys.shell_history.lines)
+        }
+
+        // Multi-tasking: a short note of recent turns from OTHER terminals,
+        // used only when the user explicitly references another window.
+        If sys.other_sessions.count > 0 {
+            OTHER_SESSIONS(sys.other_sessions.items)
+        }
+
+        CURRENT_DIR(env.cwd[@T])
+    }
+
+    // --- Multi-turn history for THIS session (chat-shaped) ----------------
+    // Only turns whose session id == the current terminal's session id.
+    History {
+        ForEach(@t: range(1, @T-1)) {
+            If sys.turn[@t].session == sys.session_id {
+                U: sys.turn[@t].instruction
+                If sys.turn[@t].kind == command {
+                    A: sys.turn[@t].command + sys.turn[@t].explanation
+                    U: sys.turn[@t].output      // [output] exit/stdout/stderr
+                }
+                Else {
+                    A: sys.turn[@t].answer
+                }
+            }
+        }
+    }
+
+    // --- This turn's request ----------------------------------------------
+    U: env.instruction[@T]
+}
+
+// Templates (filled at runtime, ALL_CAPS):
+//   INSTRUCTIONS, RESPONSE_SCHEMA  -> the static SYSTEM_PROMPT text in `doit`
+//   MEMORY(items)                  -> memory_block()
+//   PROJECT_PROFILE(path, text)    -> project_profile_block()
+//   SHELL_ACTIVITY(lines)          -> shell_activity_block()
+//   OTHER_SESSIONS(items)          -> other_sessions_note()
+//   CURRENT_DIR(cwd)               -> "Current directory: <cwd>"
+//
+// History label block            -> build_context(): turn_to_messages() over
+//                                    the current session's stored turns.

@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """doit - an interactive LLM agent that turns natural language into shell commands.
 
-This is the "basics" section: take a natural-language request, ask an LLM to
-translate it into a single shell command, classify how risky that command is,
-ask for confirmation when needed, run it, and show the result.
+Beyond the basics (translate -> classify risk -> confirm -> run), this version adds
+the "context" half of the assignment:
 
-Later sections (multi-turn history, memory, shell-history awareness, sessions,
-local/tool-calling models, ...) build on top of this structure.
+  * persistent state under ~/.doit/
+  * multi-turn history (JSONL), so a turn can refer to previous ones
+  * per-terminal sessions, so two windows keep separate history streams
+  * persistent memory about the user, surviving new shells / directories
+  * user-awareness: reads the real shell history to see what the user did by hand
+  * a project-profile extension (.doit.md), so the agent behaves per-folder
+
+Every invocation of doit is its own process / its own turn; everything that has
+to survive between turns lives on disk under ~/.doit/.
 """
 
 import json
 import os
 import subprocess
 import sys
+import time
+import uuid
 from configparser import ConfigParser
 from pathlib import Path
 
@@ -22,26 +30,43 @@ except ImportError:
     sys.exit("doit: the 'litellm' package is required. Run: pip install litellm")
 
 
+# ---------------------------------------------------------------------------
+# Paths and constants
+# ---------------------------------------------------------------------------
+
 CONFIG_PATH = Path.home() / "doit.cfg"
+STATE_DIR = Path.home() / ".doit"
+HISTORY_PATH = STATE_DIR / "history.jsonl"
+MEMORY_PATH = STATE_DIR / "memory.jsonl"
+SESSIONS_DIR = STATE_DIR / "sessions"
 
 # How a command is allowed to run.
 SAFE = "safe"          # read-only, run without asking
 CONFIRM = "confirm"    # modifies the filesystem / state, ask first
 
+# How much context we feed back to the model.
+MAX_SESSION_TURNS = 8        # recent turns from THIS terminal
+MAX_OTHER_TURNS = 4          # recent turns from OTHER terminals (for cross-refs)
+MAX_SHELL_LINES = 15         # recent manual shell commands
+OUTPUT_CLIP = 1500           # chars of stdout/stderr we keep / show the model
+
+# Project profile file name (the "agent.md" equivalent for a folder).
+PROFILE_NAME = ".doit.md"
+
 
 SYSTEM_PROMPT = """\
 You are `doit`, an assistant that converts a user's natural-language request \
-into a single shell command for bash on Linux.
+into a single shell command for bash on Linux, or answers them directly.
 
 Respond with ONLY a JSON object (no markdown fences) with these fields:
   "kind": one of "command", "answer", "refuse".
       - "command": the request maps to a shell command to run.
       - "answer":  the request is not a command to execute but should still get
                    a helpful reply -- a question ("how do I ...?"), small talk
-                   ("tell me a joke"), or a question about yourself
-                   ("what can you do?").
-      - "refuse":  the request cannot be done as a shell command (e.g. it needs
-                   information you don't have, or it isn't a shell task at all).
+                   ("tell me a joke"), a question about yourself, or a question
+                   about previous output ("why did that fail?").
+      - "refuse":  the request cannot be done as a shell command and is not a
+                   question you can answer.
   "command": the shell command string (only when kind == "command", else "").
   "risk": one of "safe", "confirm" (only when kind == "command").
       - "safe":    read-only, no side effects (ls, cat, grep, find, df, ...).
@@ -49,13 +74,35 @@ Respond with ONLY a JSON object (no markdown fences) with these fields:
                    deleting files, installing packages, writing to disks, etc.
                    (mkdir, mv, rm, dd, mkfs, pip install, git commit, ...).
   "answer": the text reply to show the user (only when kind == "answer" or
-            "refuse"; may be several sentences). Use a professional, neutral
-            tone -- never scolding or angry.
+            "refuse"). Use a professional, neutral tone.
   "explanation": one short sentence explaining the command (only when
                  kind == "command").
+  "cd": a directory to navigate to, when the user asks to "move to" / "go to"
+        a folder. Use this field for navigation instead of a `cd` command (a
+        child process cannot change the parent shell). Use `~` for the home
+        directory; NEVER guess an absolute /home/<name> path. Empty when not
+        navigating.
+  "memories_to_store": a list of short durable facts about the USER worth
+        remembering across sessions (preferences, project locations, standing
+        instructions like "always sort newest first"). Empty list if none.
+        Only store things that are clearly meant to persist. IMPORTANT: when the
+        user labels something ("this is my X folder", "call this my Y",
+        "remember that ...", "from now on ..."), store that as a memory even if
+        the same turn also performs an action like navigating.
+  "memories_to_forget": a list of memory ids (integers shown in MEMORY) to drop
+        when the user changes their mind. Empty list if none.
+
+You are given context: stored MEMORY about the user, the current PROJECT PROFILE,
+recent SHELL ACTIVITY the user ran by hand, and the multi-turn HISTORY of this
+session (and brief notes from other terminals). Use them to resolve references
+like "now sort them by date", "do it again here", or "go to my class project".
 
 Prefer a single command. Do not invent file names the user did not mention."""
 
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 def load_config():
     """Read ~/doit.cfg. Returns a dict of model settings."""
@@ -74,14 +121,293 @@ def load_config():
     return settings
 
 
-def ask_model(settings, instruction):
-    """Send the instruction to the LLM and parse its JSON reply."""
+# ---------------------------------------------------------------------------
+# State directory / session identity
+# ---------------------------------------------------------------------------
+
+def ensure_state():
+    """Create ~/.doit/ (and sessions/) on first use."""
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def session_id():
+    """Identify the terminal this invocation came from.
+
+    Preference order:
+      1. $DOIT_SESSION_ID  -- set by the .bashrc snippet, one per terminal.
+      2. ppid-<n>          -- the parent shell's pid is stable across doit
+                              calls from the same window, so it cleanly
+                              separates two terminals even without the snippet.
+    """
+    env_id = os.environ.get("DOIT_SESSION_ID", "").strip()
+    if env_id:
+        return env_id
+    return f"ppid-{os.getppid()}"
+
+
+# ---------------------------------------------------------------------------
+# History (multi-turn, per-session streams)
+# ---------------------------------------------------------------------------
+
+def save_interaction(record):
+    """Append one turn to the history JSONL log."""
+    ensure_state()
+    record = dict(record)
+    record.setdefault("ts", time.time())
+    with HISTORY_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_history():
+    """Read every recorded turn (oldest first). Tolerant of bad lines."""
+    if not HISTORY_PATH.exists():
+        return []
+    out = []
+    for line in HISTORY_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _clip(text, limit=OUTPUT_CLIP):
+    text = text or ""
+    if len(text) > limit:
+        return text[:limit] + "\n...[truncated]"
+    return text
+
+
+def turn_to_messages(turn):
+    """Render one stored turn as chat messages (for THIS session's history)."""
+    msgs = [{"role": "user", "content": turn.get("instruction", "")}]
+    kind = turn.get("kind")
+    if kind == "command":
+        cmd = turn.get("command", "")
+        expl = turn.get("explanation", "")
+        msgs.append({"role": "assistant",
+                     "content": f"(ran command) {cmd}\n# {expl}".strip()})
+        out = _clip(turn.get("stdout", ""))
+        err = _clip(turn.get("stderr", ""))
+        rc = turn.get("returncode", 0)
+        tool = f"exit={rc}"
+        if out:
+            tool += f"\nstdout:\n{out}"
+        if err:
+            tool += f"\nstderr:\n{err}"
+        # Output is fed back as a user-role note so providers that reject bare
+        # tool messages (no tool_call) still accept the history.
+        msgs.append({"role": "user", "content": f"[output]\n{tool}"})
+    else:
+        msgs.append({"role": "assistant", "content": turn.get("answer", "")})
+    return msgs
+
+
+def other_sessions_note(history, current_sid):
+    """A compact, labelled summary of recent turns from OTHER terminals.
+
+    This is what lets a user say "do the same thing we did in the other window"
+    while normal references stay scoped to the current terminal.
+    """
+    others = [t for t in history if t.get("session") != current_sid]
+    if not others:
+        return ""
+    lines = []
+    for t in others[-MAX_OTHER_TURNS:]:
+        sid = t.get("session", "?")
+        instr = t.get("instruction", "")
+        cmd = t.get("command", "")
+        piece = f'- [{sid} @ {t.get("cwd", "?")}] "{instr}"'
+        if cmd:
+            piece += f"  ->  {cmd}"
+        lines.append(piece)
+    return "Recent activity in OTHER terminals (only use if explicitly asked):\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Memory (persists across shells, dirs, sessions)
+# ---------------------------------------------------------------------------
+
+def load_memories():
+    """Return list of {id, text, ts} memory records."""
+    if not MEMORY_PATH.exists():
+        return []
+    out = []
+    for line in MEMORY_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _rewrite_memories(records):
+    ensure_state()
+    with MEMORY_PATH.open("w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def store_memories(texts):
+    """Append new memory facts, skipping exact duplicates. Returns added ones."""
+    if not texts:
+        return []
+    records = load_memories()
+    existing = {r.get("text", "").strip().lower() for r in records}
+    next_id = max([r.get("id", 0) for r in records], default=0) + 1
+    added = []
+    for text in texts:
+        text = (text or "").strip()
+        if not text or text.lower() in existing:
+            continue
+        rec = {"id": next_id, "text": text, "ts": time.time()}
+        records.append(rec)
+        added.append(rec)
+        existing.add(text.lower())
+        next_id += 1
+    if added:
+        _rewrite_memories(records)
+    return added
+
+
+def forget_memories(ids):
+    """Drop memories by id. Returns the ids actually removed."""
+    if not ids:
+        return []
+    want = {int(i) for i in ids if str(i).isdigit() or isinstance(i, int)}
+    records = load_memories()
+    kept = [r for r in records if r.get("id") not in want]
+    removed = [r.get("id") for r in records if r.get("id") in want]
+    if removed:
+        _rewrite_memories(kept)
+    return removed
+
+
+def memory_block():
+    records = load_memories()
+    if not records:
+        return ""
+    lines = [f"  [{r['id']}] {r['text']}" for r in records]
+    return "MEMORY (durable facts about the user):\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# User awareness (real shell history)
+# ---------------------------------------------------------------------------
+
+def read_shell_history(limit=MAX_SHELL_LINES):
+    """Recent commands the user typed by hand, newest last.
+
+    We read the shell's own history file. Lines that are doit invocations are
+    tagged so the model can tell its own actions apart from the user's.
+    """
+    candidates = [
+        os.environ.get("HISTFILE", ""),
+        str(Path.home() / ".bash_history"),
+        str(Path.home() / ".zsh_history"),
+    ]
+    path = next((p for p in candidates if p and Path(p).exists()), "")
+    if not path:
+        return []
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+    cleaned = []
+    for line in raw:
+        # zsh history lines look like ": 1700000000:0;the command"
+        if line.startswith(":") and ";" in line:
+            line = line.split(";", 1)[1]
+        line = line.strip()
+        if line:
+            cleaned.append(line)
+    return cleaned[-limit:]
+
+
+def shell_activity_block():
+    lines = read_shell_history()
+    if not lines:
+        return ""
+    rendered = []
+    for cmd in lines:
+        who = "doit" if cmd.startswith(("doit ", "./doit ")) or cmd == "doit" else "user"
+        rendered.append(f"  ({who}) {cmd}")
+    return ("RECENT SHELL ACTIVITY (commands seen in the user's shell history, "
+            "newest last):\n" + "\n".join(rendered))
+
+
+# ---------------------------------------------------------------------------
+# Project profiles (extension: behave differently per folder)
+# ---------------------------------------------------------------------------
+
+def find_project_profile(start=None):
+    """Walk up from cwd to home looking for a .doit.md profile file."""
+    start = Path(start or os.getcwd()).resolve()
+    home = Path.home().resolve()
+    for d in [start, *start.parents]:
+        candidate = d / PROFILE_NAME
+        if candidate.exists():
+            try:
+                return candidate, candidate.read_text(encoding="utf-8").strip()
+            except OSError:
+                return candidate, ""
+        if d == home:
+            break
+    return None, ""
+
+
+def project_profile_block():
+    path, text = find_project_profile()
+    if not text:
+        return ""
+    return (f"PROJECT PROFILE (from {path}; folder-specific instructions, "
+            f"follow them here):\n{text}")
+
+
+# ---------------------------------------------------------------------------
+# Context assembly
+# ---------------------------------------------------------------------------
+
+def build_context(settings, instruction, sid):
+    """Assemble the full message list sent to the model for this turn.
+
+    Layered as: base system prompt + (memory, project profile, shell activity,
+    cross-session notes) context blocks, then this session's multi-turn history
+    as real chat messages, then the current instruction.
+    """
+    history = load_history()
+    session_turns = [t for t in history if t.get("session") == sid]
+
+    context_blocks = [b for b in (
+        memory_block(),
+        project_profile_block(),
+        shell_activity_block(),
+        other_sessions_note(history, sid),
+        f"Current directory: {os.getcwd()}",
+    ) if b]
+
+    system = SYSTEM_PROMPT
+    if context_blocks:
+        system += "\n\n" + "\n\n".join(context_blocks)
+
+    messages = [{"role": "system", "content": system}]
+    for turn in session_turns[-MAX_SESSION_TURNS:]:
+        messages.extend(turn_to_messages(turn))
+    messages.append({"role": "user", "content": instruction})
+    return messages
+
+
+def ask_model(settings, messages):
+    """Send the assembled messages to the LLM and parse its JSON reply."""
     kwargs = {
         "model": settings["model"],
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": instruction},
-        ],
+        "messages": messages,
         "temperature": settings["temperature"],
     }
     if settings["api_key"]:
@@ -103,11 +429,19 @@ def ask_model(settings, instruction):
                 "answer": f"Could not parse model reply: {content[:200]}"}
 
 
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
 def run_command(command):
-    """Execute a shell command, streaming nothing back to the model (yet)."""
+    """Execute a shell command and capture stdout/stderr/return code.
+
+    Uses /bin/bash by default; $DOIT_BASH overrides it (handy on Windows/Git
+    Bash where bash lives elsewhere).
+    """
     print(f"$ {command}")
     result = subprocess.run(
-        command, shell=True, executable="/bin/bash",
+        command, shell=True, executable=os.environ.get("DOIT_BASH", "/bin/bash"),
         capture_output=True, text=True,
     )
     if result.stdout:
@@ -119,6 +453,18 @@ def run_command(command):
     return result
 
 
+def request_cd(sid, path):
+    """Ask the shell wrapper to actually change the parent shell's directory.
+
+    A child process cannot cd the parent, so we drop the target in a per-session
+    file. The doit() shell function (see install snippet) sources and removes it.
+    """
+    ensure_state()
+    target = os.path.expanduser(path)
+    (SESSIONS_DIR / f"{sid}.cd").write_text(target, encoding="utf-8")
+    print(f"cd {path}")
+
+
 def confirm(prompt):
     try:
         return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
@@ -127,34 +473,72 @@ def confirm(prompt):
         return False
 
 
-def handle(settings, instruction):
-    reply = ask_model(settings, instruction)
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+def handle(settings, instruction, sid):
+    messages = build_context(settings, instruction, sid)
+    reply = ask_model(settings, messages)
     kind = reply.get("kind", "refuse")
 
-    if kind == "answer":
-        print(reply.get("answer", ""))
-        return
+    # Side effects that apply regardless of kind: navigation + memory.
+    cd_target = (reply.get("cd") or "").strip()
+    if cd_target:
+        request_cd(sid, cd_target)
+    added = store_memories(reply.get("memories_to_store", []))
+    removed = forget_memories(reply.get("memories_to_forget", []))
+    for rec in added:
+        print(f"(remembered: {rec['text']})")
+    if removed:
+        print(f"(forgot memory {', '.join(str(i) for i in removed)})")
 
-    if kind == "refuse":
-        print(reply.get("answer", "") or "doit: that can't be done as a shell command.")
+    record = {
+        "session": sid, "cwd": os.getcwd(), "instruction": instruction,
+        "kind": kind,
+    }
+
+    if kind in ("answer", "refuse"):
+        answer = reply.get("answer", "") or (
+            "doit: that can't be done as a shell command." if kind == "refuse" else "")
+        if answer:
+            print(answer)
+        record["answer"] = answer
+        save_interaction(record)
         return
 
     command = reply.get("command", "").strip()
     risk = reply.get("risk", CONFIRM)
     explanation = reply.get("explanation", "")
+    record.update({"command": command, "risk": risk, "explanation": explanation})
+
     if not command:
+        # Pure navigation / memory turn with no command is fine.
+        if cd_target or added or removed:
+            save_interaction(record)
+            return
         print(f"doit: no command produced. {explanation}")
+        save_interaction(record)
         return
 
-    print(f"# {explanation}")
+    if explanation:
+        print(f"# {explanation}")
 
     if risk == CONFIRM:
         print(f"Proposed command:\n  {command}")
         if not confirm("Run it?"):
             print("Aborted.")
+            record["aborted"] = True
+            save_interaction(record)
             return
 
-    run_command(command)
+    result = run_command(command)
+    record.update({
+        "stdout": _clip(result.stdout),
+        "stderr": _clip(result.stderr),
+        "returncode": result.returncode,
+    })
+    save_interaction(record)
 
 
 def main(argv):
@@ -162,7 +546,7 @@ def main(argv):
     if not instruction:
         sys.exit("usage: doit <natural language request>")
     settings = load_config()
-    handle(settings, instruction)
+    handle(settings, instruction, session_id())
 
 
 if __name__ == "__main__":
