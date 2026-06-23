@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """doit - an interactive LLM agent that turns natural language into shell commands.
 
-This is the "basics" section: take a natural-language request, ask an LLM to
-translate it into a single shell command, classify how risky that command is,
-ask for confirmation when needed, run it, and show the result.
+Take a natural-language request, get an LLM to translate it into a single shell
+command, classify how risky that command is, ask for confirmation when needed,
+run it, and show the result.
+
+There are two ways of getting the command out of the model, chosen by the
+`tool_calling` flag in ~/doit.cfg:
+
+  * prompt-and-parse (default): the model is asked, via the system prompt, to
+    reply with a JSON object that we parse ourselves. Works with ANY model.
+  * native tool-calling: the model is given a `run_shell_command` tool and
+    answers with a structured tool call that the provider hands back cleanly.
+    Only models trained for tool use (e.g. lfm2.5) do this well; weaker models
+    should stay on prompt-and-parse.
 
 Later sections (multi-turn history, memory, shell-history awareness, sessions,
-local/tool-calling models, ...) build on top of this structure.
+...) build on top of this structure.
 """
 
 import json
@@ -57,6 +67,61 @@ Respond with ONLY a JSON object (no markdown fences) with these fields:
 Prefer a single command. Do not invent file names the user did not mention."""
 
 
+# Used only on the native tool-calling path. The structured contract lives in
+# SHELL_TOOL below, so this prompt is deliberately short -- the model decides
+# between "call the tool" and "answer in text" instead of emitting JSON.
+TOOL_SYSTEM_PROMPT = """\
+You are `doit`, an assistant that helps the user by running shell commands on \
+bash/Linux.
+
+When the user's request maps to a shell command, you MUST call the \
+`run_shell_command` tool with the command, its risk level, and a one-sentence \
+explanation. Do NOT describe the command in prose or in a code block -- always \
+express it as a tool call. This includes state-changing actions (creating, \
+moving, deleting, installing): call the tool; the harness handles asking the \
+user for confirmation. Prefer a single command. Do not invent file names the \
+user did not mention.
+
+If the request is not something to run -- a question ("how do I ...?"), small \
+talk, or something you cannot do as a shell command -- do NOT call the tool. \
+Just reply with a short, helpful text answer in a professional, neutral tone."""
+
+
+SHELL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_shell_command",
+        "description": (
+            "Run a single bash shell command on the user's Linux machine to "
+            "fulfil their request."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to run.",
+                },
+                "risk": {
+                    "type": "string",
+                    "enum": [SAFE, CONFIRM],
+                    "description": (
+                        "safe = read-only, no side effects (ls, cat, grep). "
+                        "confirm = changes or destroys files or state "
+                        "(rm, mv, mkdir, pip install)."
+                    ),
+                },
+                "explanation": {
+                    "type": "string",
+                    "description": "One short sentence explaining the command.",
+                },
+            },
+            "required": ["command", "risk", "explanation"],
+        },
+    },
+}
+
+
 def load_config():
     """Read ~/doit.cfg. Returns a dict of model settings."""
     cfg = ConfigParser()
@@ -70,27 +135,41 @@ def load_config():
         "api_base": model_section.get("api_base", ""),
         "temperature": model_section.getfloat("temperature", 0.0)
         if model_section else 0.0,
+        "tool_calling": model_section.getboolean("tool_calling", False)
+        if model_section else False,
     }
     return settings
 
 
-def ask_model(settings, instruction):
-    """Send the instruction to the LLM and parse its JSON reply."""
+def call_llm(settings, messages, use_tools):
+    """Low-level LiteLLM call. When use_tools is set, the model is offered the
+    run_shell_command tool and may answer with a structured tool call."""
     kwargs = {
         "model": settings["model"],
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": instruction},
-        ],
+        "messages": messages,
         "temperature": settings["temperature"],
     }
+    if use_tools:
+        kwargs["tools"] = [SHELL_TOOL]
+        kwargs["tool_choice"] = "auto"
     if settings["api_key"]:
         kwargs["api_key"] = settings["api_key"]
     if settings["api_base"]:
         kwargs["api_base"] = settings["api_base"]
+    return litellm.completion(**kwargs)
 
-    response = litellm.completion(**kwargs)
-    content = response["choices"][0]["message"]["content"].strip()
+
+def ask_model(settings, instruction):
+    """Prompt-and-parse path: send the instruction and parse the JSON reply."""
+    response = call_llm(
+        settings,
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": instruction},
+        ],
+        use_tools=False,
+    )
+    content = response.choices[0].message.content.strip()
 
     # Be forgiving: strip accidental ```json fences before parsing.
     if content.startswith("```"):
@@ -104,7 +183,7 @@ def ask_model(settings, instruction):
 
 
 def run_command(command):
-    """Execute a shell command, streaming nothing back to the model (yet)."""
+    """Execute a shell command and show its output."""
     print(f"$ {command}")
     result = subprocess.run(
         command, shell=True, executable="/bin/bash",
@@ -127,7 +206,20 @@ def confirm(prompt):
         return False
 
 
+def maybe_run(command, risk, explanation):
+    """Shared command-gating used by both paths: announce, confirm if risky,
+    run. Returns the completed process, or None if the user aborted."""
+    print(f"# {explanation}")
+    if risk == CONFIRM:
+        print(f"Proposed command:\n  {command}")
+        if not confirm("Run it?"):
+            print("Aborted.")
+            return None
+    return run_command(command)
+
+
 def handle(settings, instruction):
+    """Prompt-and-parse path (default; works with any model)."""
     reply = ask_model(settings, instruction)
     kind = reply.get("kind", "refuse")
 
@@ -146,15 +238,70 @@ def handle(settings, instruction):
         print(f"doit: no command produced. {explanation}")
         return
 
-    print(f"# {explanation}")
+    maybe_run(command, risk, explanation)
 
-    if risk == CONFIRM:
-        print(f"Proposed command:\n  {command}")
-        if not confirm("Run it?"):
-            print("Aborted.")
-            return
 
-    run_command(command)
+def handle_tool_calling(settings, instruction):
+    """Native tool-calling path: the model emits a structured tool call instead
+    of JSON-in-text, and we feed the command's output back so it can summarise.
+    Used when tool_calling = true in doit.cfg (model must support tools)."""
+    messages = [
+        {"role": "system", "content": TOOL_SYSTEM_PROMPT},
+        {"role": "user", "content": instruction},
+    ]
+    message = call_llm(settings, messages, use_tools=True).choices[0].message
+    tool_calls = message.tool_calls or []
+
+    if not tool_calls:
+        # The model chose to answer in plain text rather than run a command.
+        print((message.content or "").strip() or "doit: nothing to do.")
+        return
+
+    # One command per request: act on the first tool call.
+    call = tool_calls[0]
+    try:
+        args = json.loads(call.function.arguments)
+    except (json.JSONDecodeError, TypeError):
+        print(f"doit: could not parse tool arguments: {call.function.arguments!r}")
+        return
+
+    command = (args.get("command") or "").strip()
+    risk = args.get("risk", CONFIRM)
+    explanation = args.get("explanation", "")
+    if not command:
+        print(f"doit: tool call produced no command. {explanation}")
+        return
+
+    result = maybe_run(command, risk, explanation)
+    if result is None:
+        return
+
+    # Feed the result back so the model can briefly summarise it. Seeing the
+    # output is the real payoff of tool-calling over prompt-and-parse.
+    messages.append({
+        "role": "assistant",
+        "content": message.content or "",
+        "tool_calls": [{
+            "id": call.id,
+            "type": "function",
+            "function": {
+                "name": call.function.name,
+                "arguments": call.function.arguments,
+            },
+        }],
+    })
+    output = (result.stdout or "") + (result.stderr or "")
+    messages.append({
+        "role": "tool",
+        "tool_call_id": call.id,
+        "content": output.strip() or f"[exit code {result.returncode}]",
+    })
+    try:
+        summary = call_llm(settings, messages, use_tools=False).choices[0].message.content
+        if summary and summary.strip():
+            print(summary.strip())
+    except Exception as exc:  # the summary is a nicety; never fail the run for it
+        print(f"doit: (could not summarise result: {exc})", file=sys.stderr)
 
 
 def main(argv):
@@ -162,7 +309,10 @@ def main(argv):
     if not instruction:
         sys.exit("usage: doit <natural language request>")
     settings = load_config()
-    handle(settings, instruction)
+    if settings["tool_calling"]:
+        handle_tool_calling(settings, instruction)
+    else:
+        handle(settings, instruction)
 
 
 if __name__ == "__main__":
