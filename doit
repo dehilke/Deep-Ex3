@@ -63,6 +63,7 @@ MAX_SESSION_TURNS = 8        # recent turns from THIS terminal
 MAX_OTHER_TURNS = 4          # recent turns from OTHER terminals (for cross-refs)
 MAX_SHELL_LINES = 15         # recent manual shell commands
 OUTPUT_CLIP = 1500           # chars of stdout/stderr we keep / show the model
+MAX_CLARIFY_ROUNDS = 2       # how many times a turn may ask the user to clarify
 
 # Project profile file name (the "agent.md" equivalent for a folder).
 PROFILE_NAME = ".doit.md"
@@ -73,12 +74,17 @@ You are `doit`, an assistant that converts a user's natural-language request \
 into a single shell command for bash on Linux, or answers them directly.
 
 Respond with ONLY a JSON object (no markdown fences) with these fields:
-  "kind": one of "command", "answer", "refuse".
+  "kind": one of "command", "answer", "clarify", "refuse".
       - "command": the request maps to a shell command to run.
       - "answer":  the request is not a command to execute but should still get
                    a helpful reply -- a question ("how do I ...?"), small talk
                    ("tell me a joke"), a question about yourself, or a question
                    about previous output ("why did that fail?").
+      - "clarify": the request is genuinely ambiguous in a way that would change
+                   the command itself, and you cannot resolve it from context.
+                   Ask ONE short question instead of guessing. Be useful, not
+                   annoying: only clarify when it truly matters; if a sensible
+                   default exists, just use it and run the command.
       - "refuse":  the request cannot be done as a shell command and is not a
                    question you can answer.
   "command": the shell command string (only when kind == "command", else "").
@@ -89,6 +95,11 @@ Respond with ONLY a JSON object (no markdown fences) with these fields:
                    (mkdir, mv, rm, dd, mkfs, pip install, git commit, ...).
   "answer": the text reply to show the user (only when kind == "answer" or
             "refuse"). Use a professional, neutral tone.
+  "question": the single clarifying question to ask (only when kind ==
+              "clarify"). Keep it short.
+  "options": an optional list of short answer choices for the question (only
+             when kind == "clarify"), shown to the user as a numbered menu.
+             Empty list if the question is open-ended.
   "explanation": one short sentence explaining the command (only when
                  kind == "command").
   "cd": a directory to navigate to, when the user asks to "move to" / "go to"
@@ -569,11 +580,66 @@ def maybe_run(command, risk, explanation):
     return run_command(command)
 
 
+def render_clarify(reply):
+    """One-line rendering of a clarify reply, echoed back into chat history."""
+    question = (reply.get("question") or "Could you clarify what you mean?").strip()
+    options = reply.get("options") or []
+    if options:
+        opts = "; ".join(f"{i}. {o}" for i, o in enumerate(options, 1))
+        return f"{question} ({opts})"
+    return question
+
+
+def ask_clarification(reply):
+    """Show the clarifying question (with an optional numbered menu) and return
+    the user's answer. Returns None if the user gives no answer, so the caller
+    can abort cleanly instead of guessing."""
+    question = (reply.get("question") or "Could you clarify what you mean?").strip()
+    options = reply.get("options") or []
+    print(question)
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}. {opt}")
+    try:
+        answer = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not answer:
+        return None
+    # Let the user reply with the option number instead of retyping the text.
+    if answer.isdigit() and 1 <= int(answer) <= len(options):
+        answer = options[int(answer) - 1]
+    return answer
+
+
 def handle(settings, instruction, sid):
     """Prompt-and-parse path (default; works with any model). Uses full context:
     multi-turn history, memory, shell awareness, project profiles."""
     messages = build_context(settings, instruction, sid)
     reply = ask_model(settings, messages)
+
+    # Clarification loop: when the request is genuinely ambiguous the model asks
+    # one short question and we wait for an answer before continuing. Bounded so
+    # an indecisive model can't loop forever.
+    clarifications = []
+    rounds = 0
+    while reply.get("kind") == "clarify" and rounds < MAX_CLARIFY_ROUNDS:
+        rounds += 1
+        question = render_clarify(reply)
+        answer = ask_clarification(reply)
+        if answer is None:
+            print("Aborted.")
+            return
+        clarifications.append(answer)
+        messages.append({"role": "assistant", "content": question})
+        messages.append({"role": "user", "content": answer})
+        reply = ask_model(settings, messages)
+
+    if reply.get("kind") == "clarify":
+        # Still unsure after the allotted rounds: show the question, don't guess.
+        print(render_clarify(reply))
+        return
+
     kind = reply.get("kind", "refuse")
 
     # Side effects that apply regardless of kind: navigation + memory.
@@ -587,8 +653,12 @@ def handle(settings, instruction, sid):
     if removed:
         print(f"(forgot memory {', '.join(str(i) for i in removed)})")
 
+    effective_instruction = instruction
+    if clarifications:
+        effective_instruction += " (clarified: " + "; ".join(clarifications) + ")"
+
     record = {
-        "session": sid, "cwd": os.getcwd(), "instruction": instruction,
+        "session": sid, "cwd": os.getcwd(), "instruction": effective_instruction,
         "kind": kind,
     }
 
