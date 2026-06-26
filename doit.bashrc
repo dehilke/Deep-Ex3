@@ -1,7 +1,7 @@
 # doit shell integration — source this from ~/.bashrc (or ~/.zshrc):
 #   echo 'source /path/to/doit.bashrc' >> ~/.bashrc
 #
-# It does three things, all documented in docs/report.md (§15):
+# It does three things, all documented in docs/report.md:
 #   1. gives each terminal window a stable session id (per-window history),
 #   2. flushes shell history after every command (so doit sees recent actions),
 #   3. wraps doit so it can change the *parent* shell's directory.
