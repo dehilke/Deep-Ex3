@@ -35,11 +35,16 @@ export OPENAI_API_KEY=sk-...
 ./doit delete all the .tmp files
 ```
 
-- **Read-only** commands run immediately.
-- **State-changing** commands are shown and require confirmation.
-- **Dangerous** commands are refused.
+- **Read-only** (`safe`) commands run immediately.
+- **State-changing** (`confirm`) commands are shown with an explanation and run
+  only after you confirm.
+- Requests that aren't shell commands are answered directly; ones that can't be
+  done at all are refused.
 
 ## Status
 
-Basics implemented. Planned next: multi-turn history, user memory,
-shell-history awareness, cross-session support, local & tool-calling models.
+All assignment sections implemented: the command path (translate → classify →
+confirm → run), clarifying questions, model flexibility (cloud / local /
+native tool-calling via LiteLLM), and the full context layer — multi-turn
+history, persistent memory, shell-history awareness, multi-session separation,
+and the project-profile extension. See `docs/report.md` for the full write-up.

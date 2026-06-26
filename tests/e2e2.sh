@@ -2,12 +2,15 @@
 # E2E for sessions / cross-session refs / user-awareness / project profiles.
 set -e
 
-REAL_HOME=/home/bentau
-REPO=/mnt/c/Users/User/Desktop/Deep-Ex3
+# Resolve the repo from this script's own location; keep using the caller's HOME.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REAL_HOME="${REAL_HOME:-$HOME}"
+PYBIN="${PYBIN:-python3}"
 
 TMP=$(mktemp -d)
 cp "$REAL_HOME/doit.cfg" "$TMP/doit.cfg"
-export PYTHONPATH="$REAL_HOME/.local/lib/python3.12/site-packages:$PYTHONPATH"
+# Keep installed packages (litellm) importable even though HOME is isolated below.
+export PYTHONPATH="$("$PYBIN" -c 'import os,site; print(os.pathsep.join((site.getsitepackages() if hasattr(site,"getsitepackages") else [])+[site.getusersitepackages()]))' 2>/dev/null):$PYTHONPATH"
 export HOME="$TMP"
 
 CLASS="$TMP/school/llms/ass3"; mkdir -p "$CLASS"; touch "$CLASS/z.txt" "$CLASS/a.txt"
