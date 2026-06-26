@@ -64,6 +64,7 @@ MAX_OTHER_TURNS = 4          # recent turns from OTHER terminals (for cross-refs
 MAX_SHELL_LINES = 15         # recent manual shell commands
 OUTPUT_CLIP = 1500           # chars of stdout/stderr we keep / show the model
 MAX_CLARIFY_ROUNDS = 2       # how many times a turn may ask the user to clarify
+COMMAND_TIMEOUT = 20         # seconds before a hung command is killed (exit 124)
 
 # Project profile file name (the "agent.md" equivalent for a folder).
 PROFILE_NAME = ".doit.md"
@@ -503,21 +504,61 @@ def call_llm(settings, messages, use_tools):
     return litellm.completion(**kwargs)
 
 
+def extract_json_object(text):
+    """Pull the first balanced ``{...}`` object out of a model reply.
+
+    Strong models return clean JSON; weaker local models often wrap it in prose
+    or ```json fences. We strip a leading fence, then scan for the first
+    balanced object, tracking brace depth and ignoring braces that appear inside
+    string literals (with backslash-escape handling). Returns the JSON substring,
+    or "" if no balanced object is found.
+    """
+    if not text:
+        return ""
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.strip("`")  # drop ```json / ``` fences
+    start = s.find("{")
+    if start == -1:
+        return ""
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    return ""  # unbalanced / truncated
+
+
 def ask_model(settings, messages):
     """Prompt-and-parse path: send the assembled context messages and parse the
     JSON reply."""
     response = call_llm(settings, messages, use_tools=False)
-    content = response.choices[0].message.content.strip()
+    content = (response.choices[0].message.content or "").strip()
 
-    # Be forgiving: strip accidental ```json fences before parsing.
-    if content.startswith("```"):
-        content = content.strip("`")
-        content = content[content.find("{"):]
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        return {"kind": "refuse", "command": "", "risk": CONFIRM,
-                "answer": f"Could not parse model reply: {content[:200]}"}
+    blob = extract_json_object(content)
+    if blob:
+        try:
+            return json.loads(blob)
+        except json.JSONDecodeError:
+            pass
+    return {"kind": "refuse", "command": "", "risk": CONFIRM,
+            "answer": f"Could not parse model reply: {content[:200]}"}
 
 
 # ---------------------------------------------------------------------------
@@ -528,13 +569,34 @@ def run_command(command):
     """Execute a shell command and capture stdout/stderr/return code.
 
     Uses /bin/bash by default; $DOIT_BASH overrides it (handy on Windows/Git
-    Bash where bash lives elsewhere).
+    Bash where bash lives elsewhere). A command that runs longer than
+    COMMAND_TIMEOUT seconds (e.g. `tail -f`, `sleep 100`) is killed and recorded
+    as exit code 124, so a hung command never freezes the agent.
     """
     print(f"$ {command}")
-    result = subprocess.run(
-        command, shell=True, executable=os.environ.get("DOIT_BASH", "/bin/bash"),
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            command, shell=True,
+            executable=os.environ.get("DOIT_BASH", "/bin/bash"),
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or ""
+        err = exc.stderr or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "ignore")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "ignore")
+        if out:
+            print(out, end="")
+        msg = f"doit: command timed out after {COMMAND_TIMEOUT}s and was killed."
+        if err:
+            print(err, end="", file=sys.stderr)
+        print(f"{msg}   [exit code 124]", file=sys.stderr)
+        return subprocess.CompletedProcess(
+            command, 124, stdout=out,
+            stderr=(err + ("\n" if err and not err.endswith("\n") else "") + msg),
+        )
     if result.stdout:
         print(result.stdout, end="")
     if result.stderr:
